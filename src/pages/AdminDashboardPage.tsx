@@ -1,0 +1,354 @@
+import { ArrowRight, Edit3, Home, LogOut, PackagePlus, Plus, ShoppingBag, Trash2 } from 'lucide-react'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
+import { useState } from 'react'
+import { AdminHeader } from '../components/admin/AdminHeader'
+import { ConfirmDialog } from '../components/admin/ConfirmDialog'
+import { useAdminProducts } from '../hooks/useProducts'
+import { isValidImage } from '../lib/validation'
+import { titleFromFileName } from '../lib/format'
+import { createProduct, deleteProduct, updateProduct } from '../services/products'
+import { uploadProductImage } from '../services/storage'
+import { writeBatch, doc, serverTimestamp } from 'firebase/firestore'
+import { db } from '../lib/firebase'
+import type { Product, ProductType } from '../types'
+
+type FormProductType = 'magnet' | 'badge' | 'both';
+
+const blank = { name: '', type: 'magnet' as ProductType, price: 20, imageUrl: '', imagePath: '', sourceFileName: '', active: true, slug: '' }
+const maxImageSize = 10 * 1024 * 1024
+
+function friendlyProductError(error: unknown, fallback: string) {
+  console.error('Admin product action failed', error)
+  if (error instanceof Error) {
+    if (error.message === 'firebase-not-configured') {
+      return 'Firebase is not configured. Add Firebase environment variables in .env to save products.'
+    }
+    if (error.message.includes('timed out')) {
+      return error.message
+    }
+  }
+  const code = error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code) : ''
+  return code === 'permission-denied' ? 'You do not have permission to perform this action.' : fallback
+}
+
+function UnifiedAddProductForm({ onComplete }: { onComplete: (message: string) => void }) {
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [previewUrl, setPreviewUrl] = useState('')
+  const [productName, setProductName] = useState('')
+  const [productType, setProductType] = useState<FormProductType>('magnet')
+  const [magnetPrice, setMagnetPrice] = useState(20)
+  const [badgePrice, setBadgePrice] = useState(20)
+  const [active, setActive] = useState(true)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const chooseImage = (file?: File) => {
+    if (!file) return
+    if (!isValidImage(file)) { setError(file.size > maxImageSize ? 'Image must be 10 MB or smaller.' : 'Please choose a JPG, PNG, or WEBP image.'); return }
+    if (previewUrl) URL.revokeObjectURL(previewUrl)
+    setSelectedFile(file); setPreviewUrl(URL.createObjectURL(file)); setError('')
+  }
+
+  const resetForm = () => {
+    setSelectedFile(null)
+    if (previewUrl) URL.revokeObjectURL(previewUrl)
+    setPreviewUrl('')
+    setProductName('')
+    setProductType('magnet')
+    setMagnetPrice(20)
+    setBadgePrice(20)
+    setActive(true)
+    setError('')
+  }
+
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault()
+    setBusy(true)
+    setError('')
+    let createdIds: string[] = []
+    try {
+      // Validate
+      if (!productName.trim()) throw new Error('Please enter a product name.')
+      if (!selectedFile) throw new Error('Please choose an image.')
+
+      // Determine price(s) based on type
+      const mPrice = Number(magnetPrice)
+      const bPrice = Number(badgePrice)
+      if (isNaN(mPrice) || mPrice < 0) throw new Error('Magnet price must be a valid number.')
+      if (productType === 'both' && (isNaN(bPrice) || bPrice < 0)) throw new Error('Badge price must be a valid number.')
+
+      if (productType === 'both') {
+        // Create magnet product
+        const magnetData = {
+          name: productName.trim(),
+          type: 'magnet' as ProductType,
+          price: mPrice,
+          imageUrl: '',
+          imagePath: '',
+          sourceFileName: '',
+          active,
+          slug: productName.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+        }
+        const magnetCreated = await createProduct(magnetData)
+        createdIds.push(magnetCreated.id)
+
+        // Create badge product
+        const badgeData = {
+          name: productName.trim(),
+          type: 'badge' as ProductType,
+          price: bPrice,
+          imageUrl: '',
+          imagePath: '',
+          sourceFileName: '',
+          active,
+          slug: productName.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+        }
+        const badgeCreated = await createProduct(badgeData)
+        createdIds.push(badgeCreated.id)
+
+        // Upload image once (using magnet product ID)
+        const uploaded = await uploadProductImage(magnetCreated.id, selectedFile)
+        // Update both products with the same image
+        await updateProduct(magnetCreated.id, { imagePath: uploaded.path, imageUrl: uploaded.url, sourceFileName: selectedFile.name })
+        await updateProduct(badgeCreated.id, { imagePath: uploaded.path, imageUrl: uploaded.url, sourceFileName: selectedFile.name })
+      } else {
+        // Single product (magnet or badge)
+        const data = {
+          name: productName.trim(),
+          type: productType === 'magnet' ? 'magnet' : 'badge' as ProductType,
+          price: productType === 'magnet' ? mPrice : bPrice,
+          imageUrl: '',
+          imagePath: '',
+          sourceFileName: '',
+          active,
+          slug: productName.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+        }
+        const created = await createProduct(data)
+        createdIds.push(created.id)
+        if (selectedFile) {
+          const uploaded = await uploadProductImage(created.id, selectedFile)
+          await updateProduct(created.id, { imagePath: uploaded.path, imageUrl: uploaded.url, sourceFileName: selectedFile.name })
+        }
+      }
+
+      onComplete(`Product${productType === 'both' ? 's' : ''} added successfully.`)
+      resetForm()
+    } catch (err: any) {
+      // Cleanup any created products on error
+      for (const id of createdIds) {
+        await deleteProduct(id).catch((cleanupError) => console.error('Could not clean up failed product', cleanupError))
+      }
+      setError(err.message ?? 'Could not save this product. Please try again.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const image = previewUrl || ''
+
+  return (
+    <form className="admin-form-card" onSubmit={handleSubmit}>
+      <div className="card-title-row">
+        <div>
+          <p className="eyebrow">Add product</p>
+          <h2>Add a new product to your catalog</h2>
+        </div>
+      </div>
+      <div className="editor-image-area">
+        {image ? <img src={image} alt={`${productName || 'Product'} preview`} /> : <ShoppingBag size={32} />}
+        <label className="btn btn-secondary" htmlFor="unified-product-image">
+          {image ? 'Replace image' : 'Choose image'}
+          <input id="unified-product-image" type="file" accept="image/jpeg,image/png,image/webp" hidden onChange={(event) => chooseImage(event.target.files?.[0])} />
+        </label>
+        {image && (
+          <button className="btn btn-quiet" type="button" onClick={() => {
+            if (previewUrl) URL.revokeObjectURL(previewUrl)
+            setPreviewUrl('')
+            setSelectedFile(null)
+          }}>
+            Remove image
+          </button>
+        )}
+      </div>
+      <div className="form-field">
+        <label htmlFor="unified-product-name">Product name</label>
+        <input id="unified-product-name" required value={productName} onChange={(event) => setProductName(event.target.value)} placeholder="e.g. Ganesha" />
+      </div>
+      <div className="form-field">
+        <label>Product type</label>
+        <div className="type-options" style={{ display: 'flex', gap: '16px', alignItems: 'center' }}>
+          <label className="type-option" style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+            <input
+              type="radio"
+              value="magnet"
+              checked={productType === 'magnet'}
+              onChange={() => setProductType('magnet')}
+              style={{ width: 16, height: 16 }}
+            />
+            Magnet
+          </label>
+          <label className="type-option" style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+            <input
+              type="radio"
+              value="badge"
+              checked={productType === 'badge'}
+              onChange={() => setProductType('badge')}
+              style={{ width: 16, height: 16 }}
+            />
+            Badge
+          </label>
+          <label className="type-option" style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+            <input
+              type="radio"
+              value="both"
+              checked={productType === 'both'}
+              onChange={() => setProductType('both')}
+              style={{ width: 16, height: 16 }}
+            />
+            Both
+          </label>
+        </div>
+      </div>
+      {productType === 'both' ? (
+        <>
+          <div className="form-row">
+            <div className="form-field">
+              <label htmlFor="unified-magnet-price">Magnet price (₹)</label>
+              <input id="unified-magnet-price" required min="0" type="number" value={magnetPrice} onChange={(event) => setMagnetPrice(Number(event.target.value))} />
+            </div>
+            <div className="form-field">
+              <label htmlFor="unified-badge-price">Badge price (₹)</label>
+              <input id="unified-badge-price" required min="0" type="number" value={badgePrice} onChange={(event) => setBadgePrice(Number(event.target.value))} />
+            </div>
+          </div>
+        </>
+      ) : (
+        <div className="form-field">
+          <label htmlFor="unified-price">Price (₹)</label>
+          <input id="unified-price" required min="0" type="number" value={productType === 'magnet' ? magnetPrice : badgePrice} onChange={(event) => {
+            if (productType === 'magnet') setMagnetPrice(Number(event.target.value))
+            else setBadgePrice(Number(event.target.value))
+          }} />
+        </div>
+      )}
+      <label className="form-check">
+        <input type="checkbox" checked={active} onChange={(event) => setActive(event.target.checked)} />
+        <span>Show this product in the shop</span>
+      </label>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <button className="btn btn-primary btn-block" disabled={busy} type="submit">
+        {busy ? 'Adding…' : 'Add product'}
+      </button>
+    </form>
+  )
+}
+
+function ProductEditor({ product, onSaved, onCancel }: { product?: Product; onSaved: (message: string) => void; onCancel?: () => void }) {
+  const [form, setForm] = useState(product ? { name: product.name, type: product.type, price: product.price, imageUrl: product.imageUrl, imagePath: product.imagePath, sourceFileName: product.sourceFileName || '', active: product.active, slug: product.slug } : blank)
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [previewUrl, setPreviewUrl] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const updateField = <K extends keyof typeof blank>(key: K, value: typeof blank[K]) => setForm((current) => ({ ...current, [key]: value }))
+  const chooseImage = (file?: File) => {
+    if (!file) return
+    if (!isValidImage(file)) { setError(file.size > maxImageSize ? 'Image must be 10 MB or smaller.' : 'Please choose a JPG, PNG, or WEBP image.'); return }
+    if (previewUrl) URL.revokeObjectURL(previewUrl)
+    setSelectedFile(file); setPreviewUrl(URL.createObjectURL(file)); setError('')
+  }
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault(); setBusy(true); setError('')
+    let createdId = ''
+    try {
+      const data = { ...form, name: form.name.trim(), slug: form.slug || form.name.toLowerCase().replace(/[^a-z0-9]+/g, '-'), price: Number(form.price) }
+      if (!data.name) throw new Error('name-required')
+      if (product) {
+        if (selectedFile) { const uploaded = await uploadProductImage(product.id, selectedFile); await updateProduct(product.id, { ...data, imagePath: uploaded.path, imageUrl: uploaded.url, sourceFileName: selectedFile.name }) } else await updateProduct(product.id, data)
+        onSaved('Product changes saved.')
+      } else {
+        const created = await createProduct({ ...data, active: selectedFile ? false : data.active }); createdId = created.id
+        if (selectedFile) { const uploaded = await uploadProductImage(created.id, selectedFile); await updateProduct(created.id, { imagePath: uploaded.path, imageUrl: uploaded.url, sourceFileName: selectedFile.name, active: data.active }) }
+        onSaved('Product added successfully.')
+      }
+    } catch (actionError) {
+      if (createdId) await deleteProduct(createdId).catch((cleanupError) => console.error('Could not clean up failed product', cleanupError))
+      setError(actionError instanceof Error && actionError.message === 'name-required' ? 'Please enter a product name.' : friendlyProductError(actionError, 'Could not save this product. Please try again.'))
+    } finally { setBusy(false) }
+  }
+  const image = previewUrl || form.imageUrl
+  return <form className="admin-form-card" onSubmit={save}><div className="card-title-row"><div><p className="eyebrow">{product ? 'Edit product' : 'One product'}</p><h2>{product ? 'Update product' : 'Add a product'}</h2></div>{product && <button className="btn btn-secondary" type="button" onClick={onCancel}>Cancel</button>}</div><div className="editor-image-area">{image ? <img src={image} alt={`${form.name || 'Product'} preview`} /> : <ShoppingBag size={32} />}<label className="btn btn-secondary" htmlFor="single-product-image">{image ? 'Replace image' : 'Choose image'}<input id="single-product-image" type="file" accept="image/jpeg,image/png,image/webp" hidden onChange={(event) => chooseImage(event.target.files?.[0])} /></label>{image && <button className="btn btn-quiet" type="button" onClick={() => { if (previewUrl) URL.revokeObjectURL(previewUrl); setPreviewUrl(''); setSelectedFile(null); updateField('imageUrl', ''); updateField('imagePath', ''); updateField('sourceFileName', '') }}>Remove image</button>}</div><div className="form-field"><label htmlFor="single-product-name">Product name</label><input id="single-product-name" required value={form.name} onChange={(event) => updateField('name', event.target.value)} placeholder="e.g. Ganesha" /></div><div className="form-row"><div className="form-field"><label htmlFor="single-product-type">Product type</label><select id="single-product-type" value={form.type} onChange={(event) => updateField('type', event.target.value as ProductType)}><option value="magnet">Magnet</option><option value="badge">Badge</option></select></div><div className="form-field"><label htmlFor="single-product-price">Price (₹)</label><input id="single-product-price" required min="0" type="number" value={form.price} onChange={(event) => updateField('price', Number(event.target.value))} /></div></div><label className="form-check"><input type="checkbox" checked={form.active} onChange={(event) => updateField('active', event.target.checked)} /> <span>Show this product in the shop</span></label>{error && <p className="form-error" role="alert">{error}</p>}<button className="btn btn-primary btn-block" disabled={busy} type="submit">{busy ? 'Saving…' : product ? 'Save changes' : 'Add product'}</button></form>
+  }
+
+function ProductManagement({ products, onNotice }: { products: Product[]; onNotice: (message: string) => void }) {
+  const [selected, setSelected] = useState<string[]>([])
+  const [editing, setEditing] = useState<Product | undefined>()
+  const [confirm, setConfirm] = useState<Product[] | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [bulkPrice, setBulkPrice] = useState('')
+  const [bulkPriceConfirm, setBulkPriceConfirm] = useState<Product[] | null>(null)
+  const allSelected = products.length > 0 && selected.length === products.length
+  const toggle = (id: string) => setSelected((current) => current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id])
+  const remove = async () => {
+    if (!confirm) return
+    setBusy(true); let removed = 0; let failed = 0
+    for (const product of confirm) { try { await deleteProduct(product.id); removed += 1 } catch (error) { failed += 1; console.error('Product deletion failed', error) } }
+    setBusy(false); setConfirm(null); setSelected([]); onNotice(`${removed} product${removed === 1 ? '' : 's'} deleted${failed ? `. ${failed} could not be deleted.` : '.'}`)
+  }
+  const updateSelectedPrices = async () => {
+    if (!bulkPriceConfirm) return
+    setBusy(true)
+    try {
+      // Use Firestore batch for efficient updates
+      const batch = writeBatch(db)
+      const priceValue = parseFloat(bulkPrice)
+
+      for (const product of bulkPriceConfirm) {
+        const productRef = doc(db, 'products', product.id)
+        batch.update(productRef, { price: priceValue, updatedAt: serverTimestamp() })
+      }
+
+      await batch.commit()
+      setBusy(false)
+      setBulkPriceConfirm(null)
+      setBulkPrice('')
+      setSelected([]) // Clear selection after update
+      onNotice(`${bulkPriceConfirm.length} product${bulkPriceConfirm.length === 1 ? '' : 's'} updated to ₹${bulkPrice}`)
+    } catch (error) {
+      setBusy(false)
+      console.error('Bulk price update failed:', error)
+      onNotice('Failed to update prices. Please try again.')
+    }
+  }
+  return <section className="admin-list-card"><div className="card-title-row"><div><p className="eyebrow">Your catalog</p><h2>Manage products <span className="count-badge">{products.length}</span></h2></div><div className="list-actions"><button className="btn btn-secondary" type="button" onClick={() => setSelected(allSelected ? [] : products.map((product) => product.id))}>{allSelected ? 'Clear selection' : 'Select all'}</button>{selected.length > 0 && (<>
+      <button className="btn btn-warning" type="button" onClick={() => {
+        if (selected.length === 0) return
+        const productsToUpdate = products.filter((product) => selected.includes(product.id))
+        setBulkPriceConfirm(productsToUpdate)
+        // Set the bulk price to the first selected product's price as a starting point
+        if (productsToUpdate.length > 0) {
+          setBulkPrice(productsToUpdate[0].price.toString())
+        } else {
+          setBulkPrice('')
+        }
+      }}>
+        Update selected prices
+      </button>
+      <button className="btn btn-danger" type="button" onClick={() => setConfirm(products.filter((product) => selected.includes(product.id)))}><Trash2 size={17} /> Delete selected ({selected.length})</button>
+    </>)}</div></div>{!products.length ? <div className="empty-state"><p>No products yet. Add one or load the starter catalog.</p></div> : <div className="admin-product-list">{products.map((product) => <div className={`admin-product-row ${selected.includes(product.id) ? 'is-selected' : ''}`} key={product.id}><label className="product-select"><input type="checkbox" checked={selected.includes(product.id)} onChange={() => toggle(product.id)} aria-label={`Select ${product.name}`} /></label><img src={product.imageUrl || '/products/Ganesha.jpeg'} alt="" /><div className="product-row-copy"><strong>{product.name}</strong><span>{product.type === 'magnet' ? 'Magnet' : 'Badge'} · ₹{product.price}</span><small>{product.active ? 'Visible in shop' : 'Hidden from shop'}</small></div><div className="row-actions"><button className="btn btn-secondary" type="button" onClick={() => setEditing(product)}><Edit3 size={16} /> Edit</button><button className="btn btn-danger" type="button" onClick={() => setConfirm([product])}><Trash2 size={16} /> Delete</button></div></div>)}</div>}{confirm && <ConfirmDialog title={`Delete ${confirm.length} product${confirm.length === 1 ? '' : 's'}?`} message="This will remove the selected products from your storefront. This cannot be undone." onCancel={() => setConfirm(null)} onConfirm={() => void remove()} busy={busy} />}{bulkPriceConfirm && <div className="dialog-backdrop" role="presentation"><div className="editor-dialog"><div className="admin-form-card"><div className="card-title-row"><div><p className="eyebrow">Update prices</p><h2>Set same price for {bulkPriceConfirm.length} selected product{bulkPriceConfirm.length === 1 ? '' : 's'}</h2></div></div><div className="form-field"><label htmlFor="bulk-price-input">Price (₹)</label><input id="bulk-price-input" required min="0" type="number" value={bulkPrice} onChange={(event) => setBulkPrice(event.target.value)} /></div>{busy ? <p className="form-error" role="alert">Updating prices...</p> : null}<button className="btn btn-primary btn-block" disabled={busy || !bulkPrice || parseFloat(bulkPrice) < 0} type="button" onClick={updateSelectedPrices}>
+        {busy ? 'Updating...' : 'Update prices'}
+      </button><button className="btn btn-quiet" type="button" onClick={() => {
+        setBulkPriceConfirm(null)
+        setBulkPrice('')
+      }}>Cancel</button></div></div></div>}{editing && <div className="dialog-backdrop" role="presentation"><div className="editor-dialog"><ProductEditor product={editing} onCancel={() => setEditing(undefined)} onSaved={(message) => { setEditing(undefined); onNotice(message) }} /></div></div>}</section>
+  }
+
+function AdminHome({ products }: { products: Product[] }) {
+  return <><div className="admin-welcome"><p className="eyebrow">Welcome</p><h1>What would you like to do?</h1><p className="muted">Choose an action below. Everything is written in simple steps.</p></div><div className="admin-action-grid"><Link className="admin-action-card action-primary" to="/admin/products/add"><span className="action-icon"><Plus size={26} /></span><span><strong>Add products</strong><small>Upload one or many product images</small></span><ArrowRight size={21} /></Link><Link className="admin-action-card" to="/admin/products"><span className="action-icon"><Edit3 size={25} /></span><span><strong>Manage products</strong><span>Edit prices, images, or remove products</span></span><ArrowRight size={21} /></Link><Link className="admin-action-card" to="/admin/orders"><span className="action-icon"><ShoppingBag size={25} /></span><span><strong>View orders</strong><small>See customer orders and update status</small></span><ArrowRight size={21} /></Link><Link className="admin-action-card" to="/admin/orders/custom"><span className="action-icon"><PackagePlus size={25} /></span><span><strong>Custom orders</strong><small>Find orders with customer images</small></span><ArrowRight size={21} /></Link></div><div className="admin-stats"><div><strong>{products.length}</strong><span>Products</span></div><div><strong>—</strong><span>Pending orders</span></div><div><strong>—</strong><span>Completed orders</span></div></div></>
+  }
+
+export function AdminDashboardPage() {
+  const location = useLocation(); const navigate = useNavigate(); const { products, error } = useAdminProducts(); const [notice, setNotice] = useState('')
+  const mode = location.pathname.split('/').filter(Boolean).slice(1).join('/') || 'home'
+  const isAdd = mode === 'products/add'; const isManage = mode === 'products'
+  return <main className="admin-page"><AdminHeader /><div className="container admin-content">{notice && <div className="notice" role="status">{notice}</div>}{error && <div className="notice notice-error" role="alert">{error}</div>}{mode !== 'home' && <Link className="back-link" to="/admin"><Home size={17} /> Back to dashboard</Link>}{mode === 'home' && <><AdminHome products={products} /><div className="admin-secondary-actions"><Link className="btn btn-primary" to="/admin/products/add"><Plus size={18} /> Add products</Link><button className="btn btn-quiet" type="button" onClick={() => navigate('/admin/products')}><Edit3 size={17} /> Manage all products</button></div></>}{isAdd && <UnifiedAddProductForm onComplete={setNotice} />}{isManage && <ProductManagement products={products} onNotice={setNotice} />}</div></main>
+  }
